@@ -26,3 +26,8 @@ logs/
 # Misc
 ngrok.exe
 ngrok
+backend/.venv/
+backend/__pycache__/
+backend/generated_audio/
+backend/migration_test.db
+voicecaller.db
