@@ -7,7 +7,7 @@ from flask import Blueprint, current_app, jsonify, request, send_from_directory
 
 from ..database import get_db
 from ..models import CallJob
-from ..services.llm_service import process_message
+from ..services.llm_service import normalize_indian_number, process_message
 from ..services.tts_service import generate_audio
 from ..tasks.call_task import execute_call
 from ..utils.helpers import (
@@ -25,25 +25,47 @@ GENERATED_AUDIO_DIR = Path(__file__).resolve().parents[2] / "generated_audio"
 @dataclass
 class ScheduleCallRequest:
     user_id: str
-    contact_name: str
-    contact_number: str
-    message: str
     user_name: str
+    raw_prompt: str
+    contacts: list[dict]
     chosen_time: Optional[str] = None
+    confirmed_number: Optional[str] = None
+    confirmed_contact_name: Optional[str] = None
+    confirmed_message: Optional[str] = None
+    confirmed: bool = False
+    agent_result: Optional[dict] = None
 
     @classmethod
     def from_dict(cls, payload: dict):
-        required_fields = ["user_id", "contact_name", "contact_number", "message", "user_name"]
+        required_fields = ["user_id", "user_name", "raw_prompt"]
         missing_fields = [field for field in required_fields if not str(payload.get(field, "")).strip()]
         if missing_fields:
             raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
+        contacts = payload.get("contacts", [])
+        if not isinstance(contacts, list) or any(not isinstance(contact, dict) for contact in contacts):
+            raise ValueError("contacts must be a list of objects containing name and number fields.")
+        agent_result = payload.get("agent_result")
+        if agent_result is not None and not isinstance(agent_result, dict):
+            raise ValueError("agent_result must be an object when provided.")
         return cls(
             user_id=str(payload["user_id"]).strip(),
-            contact_name=str(payload["contact_name"]).strip(),
-            contact_number=str(payload["contact_number"]).strip(),
-            message=str(payload["message"]).strip(),
             user_name=str(payload["user_name"]).strip(),
+            raw_prompt=str(payload["raw_prompt"]).strip(),
+            contacts=contacts,
             chosen_time=str(payload["chosen_time"]).strip() if payload.get("chosen_time") else None,
+            confirmed_number=(
+                str(payload["confirmed_number"]).strip() if payload.get("confirmed_number") else None
+            ),
+            confirmed_contact_name=(
+                str(payload["confirmed_contact_name"]).strip()
+                if payload.get("confirmed_contact_name")
+                else None
+            ),
+            confirmed_message=(
+                str(payload["confirmed_message"]).strip() if payload.get("confirmed_message") else None
+            ),
+            confirmed=payload.get("confirmed") is True,
+            agent_result=agent_result,
         )
 
 
@@ -60,12 +82,83 @@ def _schedule_job(job_id: str, scheduled_time) -> None:
     )
 
 
-def _resolve_scheduled_time(chosen_time: Optional[str], llm_result: dict):
-    if chosen_time:
-        return ensure_ist_datetime(chosen_time), True
-    if llm_result.get("time_extracted") and llm_result.get("scheduled_time"):
-        return ensure_ist_datetime(llm_result["scheduled_time"]), True
-    return None, False
+def _build_spoken_message(user_name: str, contact_name: str, message: str) -> str:
+    cleaned_message = " ".join(str(message or "").strip().split())
+    prefix = f"Hi {contact_name or 'there'}, this is an automated message on behalf of {user_name}."
+    if not cleaned_message:
+        return prefix
+    punctuation = "" if cleaned_message.endswith((".", "!", "?")) else "."
+    return f"{prefix} {cleaned_message}{punctuation}"
+
+
+def _prepare_agent_result(schedule_request: ScheduleCallRequest, current_time_ist) -> dict:
+    if schedule_request.confirmed and schedule_request.agent_result:
+        agent_result = dict(schedule_request.agent_result)
+    else:
+        agent_result = process_message(
+            raw_prompt=schedule_request.raw_prompt,
+            user_name=schedule_request.user_name,
+            contacts=schedule_request.contacts,
+            current_time_ist=current_time_ist,
+        )
+
+    if schedule_request.confirmed_contact_name:
+        agent_result["contact_name"] = schedule_request.confirmed_contact_name
+    if schedule_request.confirmed_number:
+        agent_result["contact_number"] = normalize_indian_number(schedule_request.confirmed_number)
+    if schedule_request.confirmed_message:
+        agent_result["message"] = schedule_request.confirmed_message
+    if schedule_request.chosen_time:
+        agent_result["scheduled_time"] = ensure_ist_datetime(schedule_request.chosen_time).isoformat()
+
+    contact_name = str(agent_result.get("contact_name") or "").strip()
+    contact_number = normalize_indian_number(str(agent_result.get("contact_number") or ""))
+    message = str(agent_result.get("message") or "").strip()
+    scheduled_time = None
+    if agent_result.get("scheduled_time"):
+        scheduled_time = ensure_ist_datetime(str(agent_result["scheduled_time"])).isoformat()
+
+    message_preview = str(agent_result.get("rephrased_message") or "").strip()
+    expected_prefix = f"Hi {contact_name or 'there'}, this is an automated message on behalf of {schedule_request.user_name}."
+    if not message_preview.startswith(expected_prefix) or schedule_request.confirmed_message:
+        message_preview = _build_spoken_message(schedule_request.user_name, contact_name, message)
+
+    missing_fields = []
+    if not contact_name:
+        missing_fields.append("contact_name")
+    if not contact_number:
+        missing_fields.append("contact_number")
+    if not message:
+        missing_fields.append("message")
+    if not scheduled_time:
+        missing_fields.append("scheduled_time")
+
+    return {
+        "contact_name": contact_name,
+        "contact_number": contact_number,
+        "message": message,
+        "rephrased_message": message_preview,
+        "scheduled_time": scheduled_time,
+        "time_extracted": bool(agent_result.get("time_extracted")),
+        "missing_fields": missing_fields,
+    }
+
+
+def _agent_response(agent_result: dict, status: str, validation_message: str | None = None):
+    response = {
+        "status": status,
+        "message_preview": agent_result["rephrased_message"],
+        "missing_fields": agent_result["missing_fields"],
+        "contact_name": agent_result["contact_name"],
+        "contact_number": agent_result["contact_number"],
+        "scheduled_time": agent_result["scheduled_time"],
+        "time_extracted": agent_result["time_extracted"],
+        # The browser returns this draft on confirmation so DeepSeek is not charged twice.
+        "agent_result": agent_result,
+    }
+    if validation_message:
+        response["message"] = validation_message
+    return jsonify(response), 200
 
 
 def _is_public_url(value: str) -> bool:
@@ -111,45 +204,33 @@ def schedule_call():
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
 
-    if not validate_indian_number(schedule_request.contact_number):
-        return jsonify({"status": "error", "message": "contact_number must be in +91XXXXXXXXXX format."}), 400
-
     current_time_ist = get_current_ist()
-    llm_result = process_message(
-        message=schedule_request.message,
-        user_name=schedule_request.user_name,
-        contact_name=schedule_request.contact_name,
-        current_time_ist=current_time_ist,
-    )
-    message_preview = llm_result["rephrased_message"]
-
     try:
-        scheduled_time, time_available = _resolve_scheduled_time(schedule_request.chosen_time, llm_result)
+        agent_result = _prepare_agent_result(schedule_request, current_time_ist)
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
 
-    if not time_available or scheduled_time is None:
-        return (
-            jsonify(
-                {
-                    "status": "needs_time",
-                    "message_preview": message_preview,
-                    "time_extracted": False,
-                }
-            ),
-            200,
+    if agent_result["missing_fields"]:
+        return _agent_response(agent_result, "needs_info")
+
+    scheduled_time = ensure_ist_datetime(agent_result["scheduled_time"])
+    if not is_at_least_two_minutes_ahead(scheduled_time):
+        agent_result["scheduled_time"] = None
+        if "scheduled_time" not in agent_result["missing_fields"]:
+            agent_result["missing_fields"].append("scheduled_time")
+        return _agent_response(
+            agent_result,
+            "needs_info",
+            "Choose a time at least 2 minutes ahead of the current IST time.",
         )
 
-    if not is_at_least_two_minutes_ahead(scheduled_time):
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "message": "Scheduled time must be at least 2 minutes ahead of the current IST time.",
-                }
-            ),
-            400,
-        )
+    if not schedule_request.confirmed:
+        return _agent_response(agent_result, "needs_confirmation")
+
+    if not validate_indian_number(agent_result["contact_number"]):
+        return jsonify({"status": "error", "message": "contact_number must be in +91XXXXXXXXXX format."}), 400
+
+    message_preview = agent_result["rephrased_message"]
 
     try:
         # Pre-generating audio at scheduling time makes the later Exotel call much more reliable.
@@ -173,9 +254,9 @@ def schedule_call():
     try:
         call_job = CallJob(
             user_id=schedule_request.user_id,
-            contact_name=schedule_request.contact_name,
-            contact_number=schedule_request.contact_number,
-            original_message=schedule_request.message,
+            contact_name=agent_result["contact_name"],
+            contact_number=agent_result["contact_number"],
+            original_message=agent_result["message"],
             rephrased_message=message_preview,
             audio_url=audio_url,
             scheduled_time=scheduled_time,
@@ -198,9 +279,12 @@ def schedule_call():
                 "status": "scheduled",
                 "job_id": call_job.id,
                 "call_time": scheduled_time.isoformat(),
+                "contact_name": agent_result["contact_name"],
+                "contact_number": agent_result["contact_number"],
                 "message_preview": message_preview,
                 "audio_url": audio_url,
-                "time_extracted": bool(llm_result.get("time_extracted") or schedule_request.chosen_time),
+                "time_extracted": agent_result["time_extracted"],
+                "missing_fields": [],
             }
         ),
         201,

@@ -1,7 +1,10 @@
+from urllib.parse import quote, unquote, urlparse
+
 from flask import Blueprint, Response, current_app, jsonify, request
 
 from ..database import get_db
 from ..models import CallJob
+from ..config import Config
 
 
 webhooks_bp = Blueprint("webhooks", __name__)
@@ -36,10 +39,31 @@ def _normalize_phone_suffix(value: str) -> str:
     return digits_only[-10:] if len(digits_only) >= 10 else digits_only
 
 
+def _canonicalize_audio_url(audio_url: str) -> str:
+    normalized_audio_url = str(audio_url or "").strip()
+    if not normalized_audio_url:
+        return ""
+
+    public_base_url = str(Config.PUBLIC_BASE_URL or "").strip().rstrip("/")
+    if not public_base_url:
+        return normalized_audio_url
+
+    parsed_audio_url = urlparse(normalized_audio_url)
+    if "/media/" not in parsed_audio_url.path:
+        return normalized_audio_url
+
+    filename = unquote(parsed_audio_url.path.rsplit("/", 1)[-1]).strip()
+    if not filename:
+        return normalized_audio_url
+
+    # Rebuilding the public media URL keeps old rows playable after the Cloudflare tunnel changes.
+    return f"{public_base_url}/media/{quote(filename)}"
+
+
 def _resolve_audio_url_from_request() -> str:
     explicit_audio_url = str(request.args.get("audio_url", "")).strip()
     if explicit_audio_url:
-        return explicit_audio_url
+        return _canonicalize_audio_url(explicit_audio_url)
 
     call_sid = _extract_exotel_call_sid(request.args.to_dict())
     job_id = str(request.args.get("job_id", "")).strip()
@@ -81,7 +105,7 @@ def _resolve_audio_url_from_request() -> str:
                 .order_by(CallJob.updated_at.desc())
                 .first()
             )
-        return str(call_job.audio_url).strip() if call_job and call_job.audio_url else ""
+        return _canonicalize_audio_url(call_job.audio_url) if call_job and call_job.audio_url else ""
     finally:
         db_session.close()
 
